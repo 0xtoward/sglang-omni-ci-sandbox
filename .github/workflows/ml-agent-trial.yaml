@@ -1,0 +1,46 @@
+# Trial only: prove that N runner agents on one host give N real concurrent
+# lanes, each in its own container on its own disjoint OMNI_CI_CPUSET.
+#
+# The label ml-cpu-trial is new in this repo: no existing workflow, and nothing
+# a fork PR could trigger, can reach these agents. Agents are registered
+# --ephemeral and removed when the trial ends.
+name: ml-agent-trial
+
+on:
+  push:
+    branches: ['trial/ml-agent-a2']
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ["03bf5f9273124f50e4cb0ec9c5cf5968701a8c9c 0", "03bf5f9273124f50e4cb0ec9c5cf5968701a8c9c 1", "03bf5f9273124f50e4cb0ec9c5cf5968701a8c9c 2"]
+    runs-on: [self-hosted, ml-cpu-trial]
+    timeout-minutes: 120
+    steps:
+      - name: Who am I, and where is my work tree
+        run: |
+          set -uo pipefail
+          echo "agent_runner_name      ${RUNNER_NAME}"
+          echo "agent_runner_workspace ${RUNNER_WORKSPACE}"
+          echo "agent_runner_temp      ${RUNNER_TEMP}"
+          echo "agent_cpuset_env       ${OMNI_CI_CPUSET:-<unset>}"
+          echo "agent_mask_before      $(taskset -pc $$ | awk '{print $NF}')"
+          echo "agent_job_started      $(date -u +%FT%T.%3NZ)"
+
+      - name: Replay this cell in the production image on this lane's cpuset
+        run: |
+          set -uo pipefail
+          cell="${{ matrix.cell }}"
+          sha="${cell%% *}"; parts="${cell##* }"
+          echo "agent_cell sha=$sha parts=$parts"
+          bash "$HOME/agent_cell.sh" "$sha" "$parts" "${OMNI_CI_CPUSET}" "${RUNNER_NAME}"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "agent_job_finished $(date -u +%FT%T.%3NZ)"
