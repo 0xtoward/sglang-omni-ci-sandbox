@@ -14,3 +14,4 @@ CAPABILITIES = ModelCapabilities(
 )
 
 __all__ = ["CAPABILITIES"]
+
