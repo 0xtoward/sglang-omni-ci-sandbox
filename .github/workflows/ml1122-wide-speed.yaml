@@ -1,0 +1,87 @@
+name: cpu-lane-wide-speed
+on:
+  push:
+    branches: ['trial/ml1122-wide-speed-c532b23e']
+permissions: {}
+jobs:
+  unit-test:
+    name: unit-test-${{ matrix.shard }} (${{ matrix.ref }})
+    runs-on: [self-hosted, ml-cpu-trial]
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {rev: '71c49bc45290044cabaacc1c3cfcb8802a2b9625', part: 0, shard: 'a', ref: '03bf5f92'}
+          - {rev: '71c49bc45290044cabaacc1c3cfcb8802a2b9625', part: 1, shard: 'b', ref: '03bf5f92'}
+          - {rev: '71c49bc45290044cabaacc1c3cfcb8802a2b9625', part: 2, shard: 'c', ref: '03bf5f92'}
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OMNI_CI_HOME: /data/omni-ci/run-${{ github.run_id }}-${{ matrix.rev }}
+    container:
+      image: hongccc/sglang-omni@sha256:d2fbd80ec42c8a6d9dff4b8a4fdbee35d50c5a1b41aa8dc872925da6e0c82f6a
+      options: >-
+        --rm
+        -e NVIDIA_VISIBLE_DEVICES
+        -e OMNI_CI_CPUSET
+        --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia6
+        -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+        -v /usr/lib/x86_64-linux-gnu/libcuda.so.580.126.20:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro
+        -v /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.580.126.20:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+        -v /dev/shm:/dev/shm
+        -v /data/dev-0xtoward/home/omni-ci:/data/omni-ci
+        -v /data/dev-0xtoward/home/hf-cache:/github/home/.cache/huggingface
+        -v /data/dev-0xtoward/home/hf-cache:/root/.cache/huggingface
+        -v /data/dev-0xtoward/home/ml-codex-1122/sources-full.git:/fixtures.git:ro
+        -v /data/dev-0xtoward/home/ml-codex-1122/cleanup.sh:/trial/cleanup.sh:ro
+        -v /data/dev-0xtoward/home/ml-codex-1122/agent_cell.sh:/trial/agent_cell.sh:ro
+        -v /data/dev-0xtoward/home/ml-codex-1122/job-results:/trial/results
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Materialize the exact revision recorded by upstream checkout
+        env:
+          REVISION: ${{ matrix.rev }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git -c safe.directory=/fixtures.git fetch -q --no-tags --depth=1 file:///fixtures.git "refs/heads/cell-$REVISION"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$REVISION"
+          git remote add origin https://github.com/sgl-project/sglang-omni.git
+          cp /trial/cleanup.sh .github/scripts/delete_gpu_process.sh
+          sha256sum .github/scripts/delete_gpu_process.sh
+          test ! -S /var/run/docker.sock
+          : "${OMNI_CI_CPUSET:?missing listener cpuset}"
+          echo "HOST_WORK_ROOT=$(cat /__w/.trial-host-root)"
+          source .github/scripts/pin_to_ci_cpuset.sh
+          echo "RUNNER_NAME=$RUNNER_NAME RUNNER_WORKSPACE=$RUNNER_WORKSPACE RUNNER_TEMP=$RUNNER_TEMP"
+          echo "CHECKOUT=$(git rev-parse HEAD) MASK=$OMNI_CI_CPUSET EFFECTIVE=$(taskset -pc $$)"
+          echo "JOB_PID_NS=$(readlink /proc/self/ns/pid) JOB_MNT_NS=$(readlink /proc/self/ns/mnt)"
+          findmnt -T "$GITHUB_WORKSPACE" -o TARGET,SOURCE
+      - uses: ./.github/actions/omni-setup
+        with:
+          venv-name: omni
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          PARTITION: ${{ matrix.part }}
+          OMNI_CI_STAGE_LABEL: unit-test-${{ matrix.shard }}
+        run: bash /trial/agent_cell.sh "${{ matrix.rev }}" "$PARTITION"
+      - name: Save the attempt logs and partition result
+        if: always()
+        env:
+          REVISION: ${{ matrix.rev }}
+          PARTITION: ${{ matrix.part }}
+          STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          result="/trial/results/$GITHUB_RUN_ID/$REVISION-p$PARTITION"
+          mkdir -p "$result"
+          printf '%s %s %s %s\n' "$REVISION" "$PARTITION" "$RUNNER_NAME" "$STATUS" > "$result/job.txt"
+          shopt -s nullglob
+          for f in "$RUNNER_TEMP"/omni-ci-retry/*.log; do gzip -c "$f" > "$result/$(basename "$f").gz"; done
+          cd "$result"
+          sha256sum job.txt *.gz > SHA256SUMS.tmp 2>/dev/null || sha256sum job.txt > SHA256SUMS.tmp
+          mv SHA256SUMS.tmp SHA256SUMS
