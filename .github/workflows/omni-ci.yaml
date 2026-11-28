@@ -1,0 +1,126 @@
+name: Omni CI
+
+# Control baseline mirroring sgl-project/sglang-omni preflight vulnerability (#4748):
+# preflight checks out PR code before running resolve_ci_labels.py and pr_ci_gate.py,
+# and setup executes ./.github/actions/omni-setup from the PR checkout.
+# Self-hosted H100 jobs are shimmed onto ubuntu-latest with OMNI_SIMULATED_H100=1
+# so all control/hardened experiments run end-to-end without real GPU hosts.
+
+on:
+  pull_request:
+    types: [opened, labeled, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      ci_labels:
+        description: "Space-separated CI labels, resolved like PR labels."
+        required: true
+        type: string
+
+concurrency:
+  group: omni-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  preflight:
+    name: omni-ci-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run_self_hosted: ${{ steps.plan.outputs.run_self_hosted }}
+      run_unit_test: ${{ steps.plan.outputs.run_unit_test }}
+    steps:
+      - name: Fetch CI labels
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          DISPATCH_CI_LABELS: ${{ github.event.inputs.ci_labels }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            if (context.eventName === "workflow_dispatch") {
+              const labels = (process.env.DISPATCH_CI_LABELS || "").split(/\s+/).filter(Boolean);
+              core.setOutput("labels", JSON.stringify(labels));
+              core.setOutput("draft", "false");
+            } else {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              core.setOutput("labels", JSON.stringify(pr.data.labels.map((label) => label.name)));
+              core.setOutput("draft", pr.data.draft ? "true" : "false");
+            }
+
+      - name: Block draft PR
+        if: ${{ fromJson(steps.pr.outputs.draft) }}
+        run: |
+          echo "PR is draft. Blocking Omni CI."
+          exit 1
+
+      # VULNERABLE PATTERN (faithful to upstream): checks out untrusted PR head/merge ref
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v4
+
+      - name: Resolve CI stages and models
+        id: plan
+        env:
+          LABELS_JSON: ${{ steps.pr.outputs.labels }}
+        run: |
+          python .github/scripts/resolve_ci_labels.py resolve \
+            --labels-json "${LABELS_JSON}" \
+            --seed "${GITHUB_RUN_ID}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Check PR lint and mergeability
+        if: ${{ github.event_name == 'pull_request' && steps.plan.outputs.run_self_hosted == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python .github/scripts/pr_ci_gate.py --timeout-seconds 180 --poll-seconds 5
+
+  setup:
+    name: setup - omni venv
+    needs: preflight
+    if: needs.preflight.result == 'success' && needs.preflight.outputs.run_self_hosted == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMNI_SIMULATED_H100: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Simulated H100 runner checkpoint
+        shell: bash
+        run: |
+          echo "SIMULATED_H100_RUNNER_EXECUTED job=setup pr=${{ github.event.pull_request.number }} sha=${{ github.sha }}"
+
+      - uses: ./.github/actions/omni-setup
+        with:
+          venv-name: omni
+          install-deps: "true"
+
+  pr-test:
+    name: PR Test
+    needs: [preflight, setup]
+    if: needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMNI_SIMULATED_H100: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - uses: ./.github/actions/omni-setup
+        with:
+          venv-name: omni
+
+      - name: Simulate H100 PR test
+        shell: bash
+        run: |
+          echo "SIMULATED_H100_PR_TEST_EXECUTED pr=${{ github.event.pull_request.number }} sha=${{ github.sha }}"

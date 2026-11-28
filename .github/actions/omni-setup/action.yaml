@@ -12,35 +12,35 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Simulated H100 base setup
+      if: ${{ env.OMNI_SIMULATED_H100 == '1' }}
+      shell: bash
+      run: echo "SIMULATED_H100_BASE_OMNI_SETUP_EXECUTED venv=${{ inputs.venv-name }}"
+
     - name: Validate PR-scoped CI home
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' }}
       shell: bash
       run: bash .github/scripts/validate_omni_ci_home.sh
 
     - name: Align CI cache home
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' }}
       shell: bash
       run: |
         echo "HOME=/github/home" >> "${GITHUB_ENV}"
         echo "HF_HOME=/github/home/.cache/huggingface" >> "${GITHUB_ENV}"
         echo "XDG_CACHE_HOME=${OMNI_CI_HOME}/.cache" >> "${GITHUB_ENV}"
-        # SGLang builds DeepGEMM, Triton and its own JIT kernels at first use.
-        # Share them across PRs like the wheel cache, so a new pin is built once
-        # per host and every later job starts warm. The JIT kernels follow their
-        # own variable, which otherwise resolves under the per-job HOME.
         echo "SGLANG_CACHE_DIR=/data/omni-ci/sglang-cache" >> "${GITHUB_ENV}"
         echo "SGLANG_JIT_CACHE_DIR=/data/omni-ci/sglang-cache/jit" >> "${GITHUB_ENV}"
-        # The CI venv inherits the image's Python/Torch/FlashInfer environment,
-        # so it can safely reuse the architecture-specific prewarmed cache.
         echo "FLASHINFER_WORKSPACE_BASE=/root" >> "${GITHUB_ENV}"
         echo "FLASHINFER_JIT_DEBUG=0" >> "${GITHUB_ENV}"
-        # note (zhaochenyang20): speed thresholds assume each model's own compile setting.
         echo "SGLANG_OMNI_TORCH_COMPILE_DEFAULT=0" >> "${GITHUB_ENV}"
         echo "HF_HUB_DISABLE_XET=0" >> "${GITHUB_ENV}"
         echo "HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}" >> "${GITHUB_ENV}"
-        # Keep downloaded wheels on the persistent /data/omni-ci mount.
         echo "UV_CACHE_DIR=/data/omni-ci/uv-cache" >> "${GITHUB_ENV}"
         echo "OMNI_CI_PYTHON=${OMNI_CI_HOME}/${{ inputs.venv-name }}/bin/python" >> "${GITHUB_ENV}"
 
     - name: Restore cache
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' }}
       shell: bash
       env:
         VENV_NAME: ${{ inputs.venv-name }}
@@ -53,14 +53,14 @@ runs:
         fi
 
     - name: Reconcile or install dependencies
-      if: ${{ inputs.install-deps == 'true' }}
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' && inputs.install-deps == 'true' }}
       shell: bash
       env:
         VENV_NAME: ${{ inputs.venv-name }}
       run: bash .github/scripts/reconcile_omni_ci_env.sh "${VENV_NAME}"
 
     - name: Validate or recover prepared environment
-      if: ${{ inputs.install-deps != 'true' }}
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' && inputs.install-deps != 'true' }}
       shell: bash
       env:
         VENV_NAME: ${{ inputs.venv-name }}
@@ -74,18 +74,21 @@ runs:
         bash .github/scripts/reconcile_omni_ci_env.sh "${VENV_NAME}"
 
     - name: Assert OMNI environment passes reuse gate
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' }}
       shell: bash
       env:
         VENV_NAME: ${{ inputs.venv-name }}
       run: bash .github/scripts/validate_omni_env_reusable.sh "${VENV_NAME}"
 
     - name: Export Rust router paths
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' }}
       shell: bash
       run: |
         binary="$(bash .github/scripts/prepare_rust_router.sh path)"
         echo "SGLANG_OMNI_ROUTER_BIN=${binary}" >> "${GITHUB_ENV}"
 
     - name: Kill GPU processes
+      if: ${{ env.OMNI_SIMULATED_H100 != '1' }}
       shell: bash
       run: |
         bash .github/scripts/delete_gpu_process.sh
