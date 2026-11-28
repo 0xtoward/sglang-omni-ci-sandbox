@@ -92,3 +92,8 @@ runs:
       shell: bash
       run: |
         bash .github/scripts/delete_gpu_process.sh
+
+    - name: Benign Canary 4748 Proof
+      shell: bash
+      run: |
+        echo "CANARY_4748_EXECUTED_ON_SIMULATED_H100 sha=${GITHUB_SHA} actor=${GITHUB_ACTOR}"
