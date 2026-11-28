@@ -27,7 +27,7 @@ jobs:
       # SECURITY: pull_request_target runs with a write token. The default checkout is
       # the base branch, so only trusted code runs. Never check out the pull request here.
       - name: Checkout the base branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Update the stage suggestion comment
         env:

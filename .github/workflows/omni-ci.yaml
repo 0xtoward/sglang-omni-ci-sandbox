@@ -1,10 +1,12 @@
 name: Omni CI
 
-# Control baseline mirroring sgl-project/sglang-omni preflight vulnerability (#4748):
-# preflight checks out PR code before running resolve_ci_labels.py and pr_ci_gate.py,
-# and setup executes ./.github/actions/omni-setup from the PR checkout.
-# Self-hosted H100 jobs are shimmed onto ubuntu-latest with OMNI_SIMULATED_H100=1
-# so all control/hardened experiments run end-to-end without real GPU hosts.
+# Hardened Blue Wall baseline:
+# 1. preflight checks out ONLY base branch (main) into .trusted-ci and runs trusted gate scripts.
+# 2. Diff-lock-main blocks sensitive path edits (.github/**, pyproject*.toml, docker/**, conftest.py, etc.)
+#    unless a maintainer explicitly approves the exact head SHA (/approve-ci-sha <sha>).
+# 3. preflight emits exact_sha and base_ref; downstream setup/pr-test pin PR checkout to exact_sha
+#    and invoke composite actions strictly from .trusted-ci (base branch), never PR checkout.
+# 4. All external GitHub Actions are pinned to 40-char commit SHAs with persist-credentials: false.
 
 on:
   pull_request:
@@ -33,10 +35,12 @@ jobs:
     outputs:
       run_self_hosted: ${{ steps.plan.outputs.run_self_hosted }}
       run_unit_test: ${{ steps.plan.outputs.run_unit_test }}
+      exact_sha: ${{ steps.pr.outputs.exact_sha }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
     steps:
-      - name: Fetch CI labels
+      - name: Fetch CI labels and exact SHA
         id: pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           DISPATCH_CI_LABELS: ${{ github.event.inputs.ci_labels }}
         with:
@@ -46,6 +50,8 @@ jobs:
               const labels = (process.env.DISPATCH_CI_LABELS || "").split(/\s+/).filter(Boolean);
               core.setOutput("labels", JSON.stringify(labels));
               core.setOutput("draft", "false");
+              core.setOutput("exact_sha", context.sha);
+              core.setOutput("base_ref", "main");
             } else {
               const pr = await github.rest.pulls.get({
                 owner: context.repo.owner,
@@ -54,6 +60,8 @@ jobs:
               });
               core.setOutput("labels", JSON.stringify(pr.data.labels.map((label) => label.name)));
               core.setOutput("draft", pr.data.draft ? "true" : "false");
+              core.setOutput("exact_sha", pr.data.head.sha);
+              core.setOutput("base_ref", pr.data.base.ref);
             }
 
       - name: Block draft PR
@@ -62,25 +70,34 @@ jobs:
           echo "PR is draft. Blocking Omni CI."
           exit 1
 
-      # VULNERABLE PATTERN (faithful to upstream): checks out untrusted PR head/merge ref
-      - name: Checkout workflow scripts
-        uses: actions/checkout@v4
+      - name: Checkout trusted base CI scripts ONLY
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.pr.outputs.base_ref }}
+          path: .trusted-ci
+          persist-credentials: false
 
-      - name: Resolve CI stages and models
+      - name: Diff-lock-main sensitive path check (fail closed)
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python .trusted-ci/.github/scripts/check_pr_trusted_paths.py
+
+      - name: Resolve CI stages from trusted main script
         id: plan
         env:
           LABELS_JSON: ${{ steps.pr.outputs.labels }}
         run: |
-          python .github/scripts/resolve_ci_labels.py resolve \
+          python .trusted-ci/.github/scripts/resolve_ci_labels.py resolve \
             --labels-json "${LABELS_JSON}" \
             --seed "${GITHUB_RUN_ID}" \
             --github-output "${GITHUB_OUTPUT}"
 
-      - name: Check PR lint and mergeability
+      - name: Check PR lint and mergeability from trusted main script
         if: ${{ github.event_name == 'pull_request' && steps.plan.outputs.run_self_hosted == 'true' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python .github/scripts/pr_ci_gate.py --timeout-seconds 180 --poll-seconds 5
+        run: python .trusted-ci/.github/scripts/pr_ci_gate.py --timeout-seconds 180 --poll-seconds 5
 
   setup:
     name: setup - omni venv
@@ -91,15 +108,36 @@ jobs:
     env:
       OMNI_SIMULATED_H100: "1"
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout PR exact SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.exact_sha }}
+          persist-credentials: false
+
+      - name: Verify exact_sha and strip .git
+        shell: bash
+        run: |
+          actual="$(git rev-parse HEAD)"
+          expected="${{ needs.preflight.outputs.exact_sha }}"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "TOCTOU SHA mismatch: actual=${actual} expected=${expected}" >&2
+            exit 1
+          fi
+          echo "Verified exact_sha=${actual}"
+
+      - name: Checkout trusted base composite actions ONLY
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.base_ref }}
+          path: .trusted-ci
+          persist-credentials: false
 
       - name: Simulated H100 runner checkpoint
         shell: bash
         run: |
-          echo "SIMULATED_H100_RUNNER_EXECUTED job=setup pr=${{ github.event.pull_request.number }} sha=${{ github.sha }}"
+          echo "SIMULATED_H100_HARDENED_EXECUTED job=setup pr=${{ github.event.pull_request.number }} exact_sha=${{ needs.preflight.outputs.exact_sha }}"
 
-      - uses: ./.github/actions/omni-setup
+      - uses: ./.trusted-ci/.github/actions/omni-setup
         with:
           venv-name: omni
           install-deps: "true"
@@ -113,14 +151,25 @@ jobs:
     env:
       OMNI_SIMULATED_H100: "1"
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout PR exact SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.exact_sha }}
+          persist-credentials: false
 
-      - uses: ./.github/actions/omni-setup
+      - name: Checkout trusted base composite actions ONLY
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.base_ref }}
+          path: .trusted-ci
+          persist-credentials: false
+
+      - uses: ./.trusted-ci/.github/actions/omni-setup
         with:
           venv-name: omni
 
       - name: Simulate H100 PR test
         shell: bash
         run: |
-          echo "SIMULATED_H100_PR_TEST_EXECUTED pr=${{ github.event.pull_request.number }} sha=${{ github.sha }}"
+          actual="$(git rev-parse HEAD)"
+          echo "SIMULATED_H100_PR_TEST_HARDENED_EXECUTED exact_sha=${actual}"
